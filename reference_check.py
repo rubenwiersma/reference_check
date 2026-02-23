@@ -131,9 +131,9 @@ def find_references_section(text):
     # We look for the last occurrence of these headers, 
     # as sometimes "References" appears in TOC or text.
     headers = [
-        r'\n\s*REFERENCES\s*\n',
-        r'\n\s*References\s*\n',
-        r'\n\s*Bibliography\s*\n'
+        r'\n\s*\d*\s*REFERENCES\s*\n',
+        r'\n\s*\d*\s*References\s*\n',
+        r'\n\s*\d*\s*Bibliography\s*\n'
     ]
     
     best_pos = -1
