@@ -368,11 +368,13 @@ def search_dblp(query):
         # Rate limit friendly
         time.sleep(0.3)
         resp = requests.get(DBLP_API_URL, params=params, timeout=10)
-        if resp.status_code == 429:  # Too many requests
+        tries = 0
+        while resp.status_code == 429 and tries < 3:  # Too many requests
             wait_time = int(resp.headers.get("Retry-After", 45))
             logger.warning(f"DBLP rate limit hit, waiting {wait_time} seconds...")
             time.sleep(wait_time)
             resp = requests.get(DBLP_API_URL, params=params, timeout=10)
+            tries += 1
         
         # Check for 420 (Policy Violation / Limit Exceeded)
         if resp.status_code == 420:
@@ -458,7 +460,7 @@ def search_crossref(query):
     except Exception:
         return []
 
-def is_match(ref, hit):
+def is_match(ref, hit, strict=False):
     """
     Determines if a DBLP hit matches the reference object.
     Uses title and author overlap.
@@ -569,10 +571,10 @@ def is_match(ref, hit):
     # Check swapped match: ref surnames ∩ hit first names
     swapped_overlap = len(ref_surnames & hit_first_names)
     
-    if normal_overlap > 0:
+    if (normal_overlap == len(ref_surnames)) or (not strict and normal_overlap > 0):
         return True, False
     
-    if swapped_overlap > 0:
+    if (swapped_overlap == len(ref_surnames)) or (not strict and swapped_overlap > 0):
         # Names appear swapped: what ref lists as surnames are actually first names
         return True, True
     
@@ -703,7 +705,7 @@ def check_reference(ref):
 
         for hit in hits:
             update_best(hit)
-            match, names_swapped = is_match(ref, hit)
+            match, names_swapped = is_match(ref, hit, strict=True)
             if match:
                 return True, hit, f"Crossref: {q}", names_swapped
     
@@ -908,7 +910,7 @@ def process_pdf_folder(folder_path, log_dir):
 def main():
     parser = argparse.ArgumentParser(description="Detect potential fake references in PDF submissions.")
     parser.add_argument("source", help="URL to the PDF file OR path to a .txt file containing URLs OR path to a folder of PDF files")
-    parser.add_argument('--mailto', help='Email for Crossref polite pool (optional, but recommended for faster queries)')
+    parser.add_argument("--mailto", help="Email for Crossref polite pool (optional, but recommended for faster queries)")
     args = parser.parse_args()
     CROSSREF_MAILTO = args.mailto
 
