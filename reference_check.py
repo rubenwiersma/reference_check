@@ -10,7 +10,7 @@ import time
 import xml.etree.ElementTree as ET
 import glob
 from pypdf import PdfReader
-
+import unicodedata
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -18,6 +18,80 @@ logger = logging.getLogger(__name__)
 
 DBLP_API_URL = "https://dblp.org/search/publ/api"
 ARXIV_API_URL = "http://export.arxiv.org/api/query"
+
+CROSSREF_API_URL = "https://api.crossref.org/works"
+CROSSREF_MAILTO = None  # if set, gets you into the "polite" pool (faster)
+
+def normalize_styled_unicode(text):
+    text = text.replace('\u2018', "'").replace('\u2019', "'")  # curly single quotes
+    text = text.replace('\u201c', '"').replace('\u201d', '"')  # curly double quotes
+    # Strip LaTeX accents: \'e, \"o, \`a, \^i, \~n, \=u, \.z, \v{c}, \c{c} etc.
+    text = re.sub(r"\\{1,2}['\"`^~=.vc]\{?(\w)\}?", r'\1', text)
+    text = text.replace("’", "'")
+    text = text.replace("&apos;", "'")
+    # NFKD decompose, then strip combining marks (accents)
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
+    return text
+
+LIGATURES = ['ff', 'fi', 'fl', 'tt', 'ffi', 'ffl']
+
+# common words that might have those ligatures in them
+KNOWN_WORDS = {"diffusion", "different", "field", "finite", "flexible", "flow",
+               "influence", "efficient", "offline", "profile", "filter", "rectified",
+               "refine", "reflect", "simplified", "simplification", "shuffle", "traffic", "affine", "tutte"}
+
+def repair_ligatures(text):
+    def fix_word(m):
+        prefix, bad_char, suffix = m.group(1), m.group(2), m.group(3)
+        for lig in LIGATURES:
+            candidate = prefix + lig + suffix
+            for w in KNOWN_WORDS:
+                if candidate.lower().startswith(w) or candidate.lower().endswith(w):
+                    return candidate
+        return m.group(0)
+    
+    # iterate until no more changes (handles multiple ligatures per word)
+    prev = None
+    while prev != text:
+        prev = text
+        # ligatures are sometimes read as !, #, or a unicode character like \uffff
+        text = re.sub(r'(\w*)([!#\ufffd-\uffff])(\w*)', fix_word, text)
+    return text
+
+def normalize_title(text):
+    # Strip HTML tags (e.g., <i>, </i>, <sub>, <sup>)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = normalize_styled_unicode(text)
+    text = repair_ligatures(text)
+    text = text.replace('first ed', 'first edition')
+    text = text.replace('1 ed', 'first edition')
+    text = text.replace('1st ed', 'first edition')
+    text = text.replace('second ed', 'second edition')
+    text = text.replace('2 ed', 'second edition')
+    text = text.replace('2nd ed', 'second edition')
+    text = text.replace('third ed', 'third edition')
+    text = text.replace('3 ed', 'third edition')
+    text = text.replace('3rd ed', 'third edition')
+    text = text.replace('edition.', 'edition')
+    text = text.replace('-', ' ')
+    text = text.replace('LeastSquare', 'Least Square')
+    return text
+
+def normalize_name(text):
+    # Strip LaTeX accents: \'e, \"o, \`a, \^i, \~n, \=u, \.z, \v{c}, \c{c} etc.
+    text = re.sub(r"\\['\"`^~=.vc]\{?(\w)\}?", r'\1', text)
+    # ß → ss (before NFKD, which doesn't expand ß)
+    text = text.replace('ß', 'ss')
+    # NFKD decompose, then strip combining marks (accents)
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
+    return text
+
+def normalize_for_comparison(text):
+    text = normalize_name(text)
+    text = normalize_title(text)
+    return text.lower()
 
 def download_pdf(url):
     try:
@@ -314,10 +388,83 @@ def search_dblp(query):
     except Exception:
         return []
 
+def search_crossref(query):
+    """Search Crossref and return results normalized to DBLP-like hit format."""
+    params = {
+        'query.bibliographic': query,
+        'rows': 5,
+    }
+    # Add mailto if provided — still works without it, just slower
+    if CROSSREF_MAILTO:
+        params['mailto'] = CROSSREF_MAILTO
+    try:
+        time.sleep(0.1)  # lighter rate limit than DBLP; polite pool is generous
+        resp = requests.get(CROSSREF_API_URL, params=params, timeout=15)
+
+        if resp.status_code == 429:
+            wait_time = int(resp.headers.get("Retry-After", 30))
+            logger.warning(f"Crossref rate limit hit, waiting {wait_time}s...")
+            time.sleep(wait_time)
+            resp = requests.get(CROSSREF_API_URL, params=params, timeout=15)
+
+        if resp.status_code != 200:
+            return []
+
+        items = resp.json().get('message', {}).get('items', [])
+
+        # Normalize each item into the same shape as a DBLP hit so that
+        # is_match / calculate_similarity / update_best all work unchanged.
+        hits = []
+        for item in items:
+            titles = item.get('title', [])
+            title = titles[0] if titles else ''
+
+            # Build author string: "First Last, First Last, ..."
+            authors_list = item.get('author', [])
+            author_names = []
+            for a in authors_list:
+                given = a.get('given', '')
+                family = a.get('family', '')
+                author_names.append(f"{given} {family}".strip())
+
+            # Year: try published-print, then published-online, then issued
+            year = ''
+            for date_field in ('published-print', 'published-online', 'issued'):
+                parts = item.get(date_field, {}).get('date-parts', [[]])
+                if parts and parts[0] and parts[0][0]:
+                    year = str(parts[0][0])
+                    break
+
+            venues = item.get('container-title', [])
+            venue = venues[0] if venues else ''
+
+            hit = {
+                'source': 'crossref',
+                'info': {
+                    'title': title,
+                    'authors': {
+                        'author': [{'text': name} for name in author_names]
+                    },
+                    'year': year,
+                    'venue': venue,
+                    'type': item.get('type', ''),
+                    'doi': item.get('DOI', ''),
+                    'url': item.get('URL', ''),
+                },
+            }
+            hits.append(hit)
+
+        return hits
+    except Exception:
+        return []
+
 def is_match(ref, hit):
     """
     Determines if a DBLP hit matches the reference object.
     Uses title and author overlap.
+    
+    Returns:
+        (bool, bool): (is_match, names_swapped)
     """
     info = hit.get('info', {})
     hit_title = info.get('title', '')
@@ -327,11 +474,8 @@ def is_match(ref, hit):
     ref_title = ref.get('title', '')
     ref_text = ref.get('text', '')
     
-    # We prefer matching against the extracted title, but fall back to full textual match
-    # if extraction was poor.
-    
     def normalize(s):
-        return "".join(c.lower() for c in s if c.isalnum())
+        return "".join(c.lower() for c in normalize_for_comparison(s) if c.isalnum())
     
     norm_hit_title = normalize(hit_title)
     
@@ -349,7 +493,7 @@ def is_match(ref, hit):
              match = sm.find_longest_match(0, len(norm_hit_title), 0, len(norm_ref_title))
              if match.size > len(norm_hit_title) * 0.8:
                  title_matches = True
-    
+
     # If explicit title didn't match (or wasn't found), try full text
     if not title_matches:
         norm_ref_text = normalize(ref_text)
@@ -362,10 +506,10 @@ def is_match(ref, hit):
                  title_matches = True
 
     if not title_matches:
-        return False
+        return False, False
         
     # --- Author Match ---
-    
+
     # If title matches, we MUST check authors to avoid "Hallucination by common title"
     # or "Matching the wrong paper with same title".
     
@@ -376,57 +520,69 @@ def is_match(ref, hit):
     hit_authors = [a.get('text', '') for a in hit_authors_data if isinstance(a, dict) and 'text' in a]
     # sometimes it's just a string in rare cases or different structure, but usually list of dicts or dict
     if not hit_authors and isinstance(hit_authors_data, list):
-         # Try to handle if it's just a list of strings (unlikely in DBLP API but possible)
-         hit_authors = [str(a) for a in hit_authors_data]
+        # Try to handle if it's just a list of strings (unlikely in DBLP API but possible)
+        hit_authors = [str(a) for a in hit_authors_data]
 
     ref_authors_str = ref.get('authors', '')
     if not ref_authors_str:
         # If we couldn't extract authors from PDF, we rely solely on title match
         # This is a weak check but better than failing valid refs
-        return True
-        
-    # Check for author implementation
-    # We check if at least one author surname matches
+        return True, False
     
-    def get_surnames(text):
-        # rough approximation: take last word of comma separated parts
-        # text: "A. Smith, B. Jones" -> ["Smith", "Jones"]
+    # Check for author implementation
+    def get_name_parts(text):
+        """
+        Extract (first_names, surnames) from an author string.
+        Returns two sets of normalized name parts.
+        """
         parts = text.replace(' and ', ',').split(',')
-        surnames = []
+        first_names = set()
+        surnames = set()
         for p in parts:
             p = p.strip()
-            if not p: continue
-            # last word
-            last = p.split()[-1]
-            surnames.append(normalize(last))
-        return surnames
+            if not p:
+                continue
+            words = p.split()
+            if len(words) >= 2:
+                # Assume "First [Middle...] Last" format
+                first_names.add(normalize(words[0]))
+                surnames.add(normalize(words[-1]))
+            elif len(words) == 1:
+                # Single name — could be either; add to both
+                surnames.add(normalize(words[0]))
+        return first_names, surnames
     
+    # Collect first names and surnames from hit authors
+    hit_first_names = set()
     hit_surnames = set()
     for auth in hit_authors:
-        hit_surnames.update(get_surnames(auth))
-        
-    ref_surnames = get_surnames(ref_authors_str)
+        firsts, lasts = get_name_parts(auth)
+        hit_first_names.update(firsts)
+        hit_surnames.update(lasts)
     
-    # Check overlap
-    # We require at least ONE common author surname to consider it verified?
-    # Or stricter? Fake refs often get authors completely wrong.
+    # Extract what ref claims as surnames (last word of each part)
+    _, ref_surnames = get_name_parts(ref_authors_str)
     
-    overlap = 0
-    for s in ref_surnames:
-        if s in hit_surnames:
-            overlap += 1
-            
-    if overlap > 0:
-        return True
-        
-    # If no author overlap, it's suspicious, even if title matches.
-    # However, if title is very long and exact match, maybe author parsing failed?
+    # Check normal match: ref surnames ∩ hit surnames
+    normal_overlap = len(ref_surnames & hit_surnames)
+    
+    # Check swapped match: ref surnames ∩ hit first names
+    swapped_overlap = len(ref_surnames & hit_first_names)
+    
+    if normal_overlap > 0:
+        return True, False
+    
+    if swapped_overlap > 0:
+        # Names appear swapped: what ref lists as surnames are actually first names
+        return True, True
+    
+    # No author overlap — suspicious
     if len(norm_hit_title) > 50 and title_matches:
         # High confidence title match override? 
         # Risky for "Survey on..." titles.
-        return False
+        return False, False
         
-    return False
+    return False, False
 
 def calculate_similarity(ref, hit):
     info = hit.get('info', {})
@@ -472,7 +628,7 @@ def check_reference(ref):
     4. Search ArXiv by title (fallback)
     """
     text = ref.get('text', '')
-    title_extracted = ref.get('title', '')
+    title_extracted = normalize_title(ref.get('title', ''))
     
     queries_tried = []
     best_candidate = None
@@ -495,15 +651,14 @@ def check_reference(ref):
             # For ArXiv ID lookup, we strongly trust the return if ID matches.
             # But we should still verification basic title/author match to ensure 
             # the ID wasn't just hallucinated (e.g. real ID for DIFFERENT paper).
-            if is_match(ref, hit):
-                return True, hit, f"ArXiv ID: {arxiv_id}"
+            match, names_swapped = is_match(ref, hit)
+            if match:
+                return True, hit, f"ArXiv ID: {arxiv_id}", names_swapped
             else:
                  # ID found but content mismatch -> Suspicious!
                  # But maybe just bad extraction? Let's fall through to DBLP search.
                  update_best(hit)
                  pass
-
-    # --- 2. DBLP Check ---
     
     # Decide on search query
     search_queries = []
@@ -517,7 +672,7 @@ def check_reference(ref):
         surnames = []
         for p in parts:
             p = p.strip()
-            if p:
+            if p and p[0].isupper():
                 surnames.append(p.split()[-1]) # take last word as surname
         
         author_surnames_str = " ".join(surnames)
@@ -525,23 +680,41 @@ def check_reference(ref):
     if len(title_extracted) > 5:
         # Query 1: Title + Author Surnames (Most precise)
         if author_surnames_str:
-            search_queries.append(f"{title_extracted} {author_surnames_str}")
+            search_queries.append(f"{title_extracted} {normalize_name(author_surnames_str)}")
+        else:
+            # Query 2: Just Title
+            search_queries.append(title_extracted)
             
-        # Query 2: Just Title
-        # search_queries.append(title_extracted)
     
     # Fallback: legacy splitting if we had no good title
     else:
         parts = [p.strip() for p in text.split('.') if len(p.strip()) > 3]
         candidates = sorted(parts, key=len, reverse=True)
         search_queries.extend(candidates[:2])
+
+    # --- 2. Crossref Check ---
+    for q in search_queries:
+        if len(q) < 5: continue
+
+        queries_tried.append(f"Crossref: {q}")
+        hits = search_crossref(q)
+        if not hits:
+            continue
+
+        for hit in hits:
+            update_best(hit)
+            match, names_swapped = is_match(ref, hit)
+            if match:
+                return True, hit, f"Crossref: {q}", names_swapped
     
     # Also add a query for the whole text if it's not too long
     # DBLP sometimes works well with full ref
     # search_queries.append(text[:200])
-    
+
+    # --- 3. DBLP Check ---
     for q in search_queries:
-        if len(q) < 5: continue
+        if len(q) < 5:
+            continue
         
         queries_tried.append(f"DBLP: {q}")
         hits = search_dblp(q)
@@ -554,12 +727,13 @@ def check_reference(ref):
             update_best(hit)
 
             # Use improved matching logic
-            if is_match(ref, hit):
+            match, names_swapped = is_match(ref, hit)
+            if match:
                 type_ = hit.get('info', {}).get('type', '')
                 if type_ in ['Editorship', 'Data'] or is_venue_title(hit_title):
                     continue
                 
-                return True, hit, f"DBLP: {q}"
+                return True, hit, f"DBLP: {q}", names_swapped
 
     # --- 3. ArXiv Title Search Fallback ---
     # If DBLP failed, but it claims to be ArXiv (or we just want to be thorough)
@@ -570,15 +744,16 @@ def check_reference(ref):
          else:
              # Fallback to longest part
              q = search_queries[0] if search_queries else text[:50]
-             
+
          queries_tried.append(f"ArXiv Title: {q}")
          hit = search_arxiv(q, query_type='ti')
          if hit:
              update_best(hit)
-             if is_match(ref, hit):
-                 return True, hit, f"ArXiv Title: {q}"
+             match, names_swapped = is_match(ref, hit)
+             if match:
+                 return True, hit, f"ArXiv Title: {q}", names_swapped
     
-    return False, best_candidate, "; ".join(queries_tried)
+    return False, best_candidate, "; ".join(queries_tried), False
 
 def run_check_on_file(url, submission_id=None, title=None, use_local=False):
     """
@@ -614,13 +789,14 @@ def run_check_on_file(url, submission_id=None, title=None, use_local=False):
             return "\n".join(output_lines)
 
         fake_refs = []
+        swapped_name_refs = []
         
         log_print("Verifying references against DBLP...")
         log_print(f"{'ID':<5} {'Status':<10} {'Details'}")
         log_print("-" * 60)
         
         for ref in references:
-             valid, hit, query_details = check_reference(ref)
+             valid, hit, query_details, names_swapped = check_reference(ref)
              
              status = "OK" if valid else "not found"
              if not valid:
@@ -630,6 +806,8 @@ def run_check_on_file(url, submission_id=None, title=None, use_local=False):
                  log_print(f"[{ref['id']}] {status:<10} Queries tried: {query_details}")
              else:
                  log_print(f"[{ref['id']}] {status:<10} Detected: {hit['info'].get('title', '')[:30]}... (Query: {query_details})")
+                 if names_swapped:
+                    swapped_name_refs.append((ref, hit))
 
         log_print("-" * 60)
         if fake_refs:
@@ -643,9 +821,19 @@ def run_check_on_file(url, submission_id=None, title=None, use_local=False):
                     info = closest.get('info', {})
                     c_title = info.get('title', 'Unknown')
                     c_url = info.get('url', '')
-                    log_print(f"Closest match: {c_title} ({c_url})")
+                    c_authors = info.get('authors', 'Unknown')
+                    log_print(f"Closest match: {c_title} ({c_url})\n\t by {c_authors}")
         else:
             log_print("\nAll references verified successfully.")
+        if swapped_name_refs:
+            log_print(f"\nFound {len(swapped_name_refs)} references that had authors' names backwards:")
+            for ref, hit in swapped_name_refs:
+                log_print(f"\n[{ref['id']}] {ref['text']}")
+                info = hit.get('info', {})
+                c_title = info.get('title', 'Unknown')
+                c_url = info.get('url', '')
+                c_authors = info.get('authors', 'Unknown')
+                log_print(f"Closest match: {c_title} ({c_url})\n\t by {c_authors}")
 
     finally:
         if os.path.exists(pdf_path) and not use_local:
@@ -713,13 +901,16 @@ def process_pdf_folder(folder_path, log_dir):
                     
             except Exception as e:
                 logger.error(f"Failed to process {pdf_file}: {e}")
+            print("-------------------------------------------\n\n")
     except Exception as e:
         logger.error(f"Failed to process PDF folder {folder_path}: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Detect potential fake references in PDF submissions.")
     parser.add_argument("source", help="URL to the PDF file OR path to a .txt file containing URLs OR path to a folder of PDF files")
+    parser.add_argument('--mailto', help='Email for Crossref polite pool (optional, but recommended for faster queries)')
     args = parser.parse_args()
+    CROSSREF_MAILTO = args.mailto
 
     if os.path.isdir(args.source):
         # Folder mode (PDFs)
@@ -737,7 +928,18 @@ def main():
             
     else:
         local_pdf = args.source[:4] != "http"
-        run_check_on_file(args.source, "SingleCheck", "Manual Run", use_local=local_pdf)
+        log_content = run_check_on_file(args.source, "SingleCheck", "Manual Run", use_local=local_pdf)
+        if local_pdf:
+            filename = os.path.basename(args.source)
+            submission_id = os.path.splitext(filename)[0]
+
+            log_dir = os.path.join(os.getcwd(), "reference_checks")
+            os.makedirs(log_dir, exist_ok=True)
+            
+            log_filename = f"{submission_id}.log"
+            log_path = os.path.join(log_dir, log_filename)
+            with open(log_path, 'w', encoding='utf-8') as f_out:
+                f_out.write(log_content)
 
 if __name__ == "__main__":
     main()
