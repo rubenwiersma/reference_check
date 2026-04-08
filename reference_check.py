@@ -96,6 +96,26 @@ def normalize_for_comparison(text):
     text = normalize_title(text)
     return text.lower()
 
+def _normalize_alnum(s):
+    return "".join(c for c in normalize_for_comparison(s) if c.isalnum())
+
+def _get_name_parts(text):
+    """Extract (first_names, surnames) sets from a comma/and-separated author string."""
+    parts = text.replace(' and ', ',').split(',')
+    first_names = set()
+    surnames = set()
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        words = p.split()
+        if len(words) >= 2:
+            first_names.add(_normalize_alnum(words[0]))
+            surnames.add(_normalize_alnum(words[-1]))
+        elif len(words) == 1:
+            surnames.add(_normalize_alnum(words[0]))
+    return first_names, surnames
+
 def download_pdf(url):
     try:
         logger.info(f"Downloading PDF from {url}...")
@@ -131,21 +151,14 @@ def find_references_section(text):
     text = text.replace('\r\n', '\n')
     
     # Common headers for References section
-    # We look for the last occurrence of these headers, 
+    # We look for the last occurrence of these headers,
     # as sometimes "References" appears in TOC or text.
-    headers = [
-        r'\n\s*\d*\s*REFERENCES\s*\n',
-        r'\n\s*\d*\s*References\s*\n',
-        r'\n\s*\d*\s*Bibliography\s*\n'
-    ]
-    
+    header_re = re.compile(r'\n\s*\d*\s*(?:References|Bibliography)\s*\n', re.IGNORECASE)
+
     best_pos = -1
-    patterns_re = [re.compile(h, re.IGNORECASE) for h in headers]
-    for p in patterns_re:
-        for match in p.finditer(text):
-            # strict check: uppercase or isolated
-            if match.start() > best_pos:
-                best_pos = match.end()
+    for match in header_re.finditer(text):
+        if match.start() > best_pos:
+            best_pos = match.end()
     
     if best_pos != -1:
         return text[best_pos:]
@@ -479,36 +492,33 @@ def is_match(ref, hit, strict=False):
     ref_title = ref.get('title', '')
     ref_text = ref.get('text', '')
     
-    def normalize(s):
-        return "".join(c.lower() for c in normalize_for_comparison(s) if c.isalnum())
-    
-    norm_hit_title = normalize(hit_title)
-    
+    norm_hit_title = _normalize_alnum(hit_title)
+
     title_matches = False
-    
+
     # Try strict title match pattern
     if len(ref_title) > 5:
-        norm_ref_title = normalize(ref_title)
+        norm_ref_title = _normalize_alnum(ref_title)
         # Check basic containment or fuzzy match
-        if norm_hit_title == norm_ref_title or (len(norm_hit_title)>10 and norm_hit_title in norm_ref_title):
-             title_matches = True
+        if norm_hit_title == norm_ref_title or (len(norm_hit_title) > 10 and norm_hit_title in norm_ref_title):
+            title_matches = True
         else:
-             # Fuzzy match
-             sm = SequenceMatcher(None, norm_hit_title, norm_ref_title)
-             match = sm.find_longest_match(0, len(norm_hit_title), 0, len(norm_ref_title))
-             if match.size > len(norm_hit_title) * 0.8:
-                 title_matches = True
+            # Fuzzy match
+            sm = SequenceMatcher(None, norm_hit_title, norm_ref_title)
+            match = sm.find_longest_match(0, len(norm_hit_title), 0, len(norm_ref_title))
+            if match.size > len(norm_hit_title) * 0.8:
+                title_matches = True
 
     # If explicit title didn't match (or wasn't found), try full text
     if not title_matches:
-        norm_ref_text = normalize(ref_text)
+        norm_ref_text = _normalize_alnum(ref_text)
         if norm_hit_title in norm_ref_text:
-             title_matches = True
+            title_matches = True
         else:
-             sm = SequenceMatcher(None, norm_hit_title, norm_ref_text)
-             match = sm.find_longest_match(0, len(norm_hit_title), 0, len(norm_ref_text))
-             if match.size > len(norm_hit_title) * 0.8:
-                 title_matches = True
+            sm = SequenceMatcher(None, norm_hit_title, norm_ref_text)
+            match = sm.find_longest_match(0, len(norm_hit_title), 0, len(norm_ref_text))
+            if match.size > len(norm_hit_title) * 0.8:
+                title_matches = True
 
     if not title_matches:
         return False, False
@@ -534,39 +544,16 @@ def is_match(ref, hit, strict=False):
         # This is a weak check but better than failing valid refs
         return True, False
     
-    # Check for author implementation
-    def get_name_parts(text):
-        """
-        Extract (first_names, surnames) from an author string.
-        Returns two sets of normalized name parts.
-        """
-        parts = text.replace(' and ', ',').split(',')
-        first_names = set()
-        surnames = set()
-        for p in parts:
-            p = p.strip()
-            if not p:
-                continue
-            words = p.split()
-            if len(words) >= 2:
-                # Assume "First [Middle...] Last" format
-                first_names.add(normalize(words[0]))
-                surnames.add(normalize(words[-1]))
-            elif len(words) == 1:
-                # Single name — could be either; add to both
-                surnames.add(normalize(words[0]))
-        return first_names, surnames
-    
     # Collect first names and surnames from hit authors
     hit_first_names = set()
     hit_surnames = set()
     for auth in hit_authors:
-        firsts, lasts = get_name_parts(auth)
+        firsts, lasts = _get_name_parts(auth)
         hit_first_names.update(firsts)
         hit_surnames.update(lasts)
-    
+
     # Extract what ref claims as surnames (last word of each part)
-    _, ref_surnames = get_name_parts(ref_authors_str)
+    _, ref_surnames = _get_name_parts(ref_authors_str)
     
     # Check normal match: ref surnames ∩ hit surnames
     normal_overlap = len(ref_surnames & hit_surnames)
@@ -596,16 +583,13 @@ def calculate_similarity(ref, hit):
     
     if not hit_title:
         return 0.0
-        
-    def normalize(s):
-        return "".join(c.lower() for c in s if c.isalnum())
-    
-    norm_hit = normalize(hit_title)
+
+    norm_hit = _normalize_alnum(hit_title)
     if len(ref_title) > 5:
-        norm_ref = normalize(ref_title)
+        norm_ref = _normalize_alnum(ref_title)
     else:
         # Fallback if title extraction failed
-        norm_ref = normalize(ref.get('text', ''))
+        norm_ref = _normalize_alnum(ref.get('text', ''))
         
     return SequenceMatcher(None, norm_hit, norm_ref).ratio()
 
@@ -1195,6 +1179,7 @@ def main():
     parser.add_argument("--bib", metavar="BIB_FILE", help="Path to a .bib or .bbl file to check directly (skips PDF parsing)")
     parser.add_argument("--mailto", help="Email for Crossref polite pool (optional, but recommended for faster queries)")
     args = parser.parse_args()
+    global CROSSREF_MAILTO
     CROSSREF_MAILTO = args.mailto
 
     if args.bib:
