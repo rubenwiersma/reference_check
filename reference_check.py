@@ -11,6 +11,9 @@ import xml.etree.ElementTree as ET
 import glob
 from pypdf import PdfReader
 import unicodedata
+import bibtexparser
+from bibtexparser.bparser import BibTexParser
+from bibtexparser.customization import convert_to_unicode
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -757,6 +760,285 @@ def check_reference(ref):
     
     return False, best_candidate, "; ".join(queries_tried), False
 
+def parse_bib_file(bib_path):
+    """Parse a .bib file and return a list of ref dicts compatible with check_reference."""
+    parser = BibTexParser(common_strings=True)
+    parser.customization = convert_to_unicode
+    with open(bib_path, encoding='utf-8') as f:
+        db = bibtexparser.load(f, parser=parser)
+
+    refs = []
+    for i, entry in enumerate(db.entries):
+        title = entry.get('title', '')
+        # Strip surrounding braces that BibTeX uses for case protection
+        title = re.sub(r'^\{(.*)\}$', r'\1', title.strip())
+
+        year = entry.get('year', '')
+
+        # Authors: bibtexparser gives "Last, First and Last, First" format
+        raw_authors = entry.get('author', '')
+        # Normalise to "First Last, First Last" for consistency with PDF extraction
+        author_parts = [a.strip() for a in raw_authors.split(' and ') if a.strip()]
+        normalised = []
+        for part in author_parts:
+            if ',' in part:
+                last, _, first = part.partition(',')
+                normalised.append(f"{first.strip()} {last.strip()}")
+            else:
+                normalised.append(part)
+        authors = ', '.join(normalised)
+
+        full_ref_text = f"{authors}. {year}. {title}."
+        refs.append({
+            'id': entry.get('ID', f'ref_{i+1}'),
+            'authors': authors,
+            'year': year,
+            'title': title,
+            'text': full_ref_text,
+            'raw': full_ref_text,
+        })
+    return refs
+
+
+def _clean_bbl_text(text):
+    """Strip common LaTeX commands from .bbl text, leaving plain words."""
+    # Remove \newblock, \bibAnnoteFile, \urlprefix etc.
+    text = re.sub(r'\\newblock\s*', ' ', text)
+    # {\em foo} / {\sc foo} / {\bf foo} -> foo
+    text = re.sub(r'\{\\(?:em|sc|bf|it|tt)\s+([^}]*)\}', r'\1', text)
+    # \emph{foo} -> foo
+    text = re.sub(r'\\(?:emph|textit|textbf|textsc|texttt)\{([^}]*)\}', r'\1', text)
+    # \url{...} / \href{...}{...}
+    text = re.sub(r'\\href\{[^}]*\}\{([^}]*)\}', r'\1', text)
+    text = re.sub(r'\\url\{[^}]*\}', '', text)
+    # tilde non-breaking space
+    text = text.replace('~', ' ')
+    # remaining lone braces
+    text = text.replace('{', '').replace('}', '')
+    # LaTeX accent commands: \'e, \"o, \`a, \^i, \~n, \=u, \.z, \v{c}, \c{c} etc.
+    text = re.sub(r"\\['\"`^~=.vc]\{?(\w)\}?", r'\1', text)
+    # collapse whitespace
+    return ' '.join(text.split())
+
+
+def _parse_bbl_biber(text):
+    """Parse biblatex/biber .bbl format (structured \\entry blocks)."""
+    refs = []
+    entry_blocks = re.findall(
+        r'\\entry\{([^}]+)\}\{([^}]+)\}\{[^}]*\}(.*?)\\endentry',
+        text, re.DOTALL)
+
+    for key, _, body in entry_blocks:
+        title = ''
+        year = ''
+        author_parts = []
+
+        # \field{title}{...}  (may span lines; grab until closing unescaped })
+        m = re.search(r'\\field\{title\}\{((?:[^{}]|\{[^{}]*\})*)\}', body)
+        if m:
+            title = _clean_bbl_text(m.group(1))
+
+        m = re.search(r'\\field\{year\}\{(\d{4})\}', body)
+        if m:
+            year = m.group(1)
+
+        # Author names live in  family={...} / given={...}  pairs inside \name{author}{N}{}{...}
+        name_block_m = re.search(r'\\name\{author\}\{[^}]+\}\{[^}]*\}\{(.*?)(?=\\(?:name|field|strng|endentry))',
+                                  body, re.DOTALL)
+        if name_block_m:
+            name_block = name_block_m.group(1)
+            families = re.findall(r'family=\{([^}]+)\}', name_block)
+            givens   = re.findall(r'given=\{([^}]+)\}', name_block)
+            for i, fam in enumerate(families):
+                given = givens[i] if i < len(givens) else ''
+                # Strip \bibinitperiod etc.
+                fam   = re.sub(r'\\[a-zA-Z]+', '', fam).strip()
+                given = re.sub(r'\\[a-zA-Z]+', '', given).strip()
+                author_parts.append(f"{given} {fam}".strip())
+
+        authors = ', '.join(author_parts)
+        full_ref_text = f"{authors}. {year}. {title}."
+        refs.append({'id': key, 'authors': authors, 'year': year,
+                     'title': title, 'text': full_ref_text, 'raw': full_ref_text})
+    return refs
+
+
+def _extract_braced(text, pos):
+    """Return content of the {...} block starting at pos (which must be '{'), and end pos."""
+    assert text[pos] == '{'
+    depth = 1
+    i = pos + 1
+    while i < len(text) and depth:
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+        i += 1
+    return text[pos + 1:i - 1], i
+
+
+def _parse_bbl_natbib(text):
+    """Parse plain BibTeX / natbib / ACM .bbl format (\\bibitem blocks)."""
+    # \bibitem may look like:
+    #   \bibitem{key}               (plain)
+    #   \bibitem[label]{key}        (natbib inline)
+    #   \bibitem[long label]%\n     (ACM: label spans lines, key on next line)
+    #           {key}
+    # We find every \bibitem position, then treat text between consecutive
+    # \bibitems as a block.
+    bibitem_re = re.compile(
+        r'\\bibitem'
+        r'(?:\[[^\]]*\])?\s*%?\s*\n?\s*'   # optional [label] and optional %\n
+        r'\{([^}]+)\}',                      # {key}
+        re.DOTALL,
+    )
+    matches = list(bibitem_re.finditer(text))
+    if not matches:
+        return []
+
+    # Detect ACM format by presence of \bibfield / \bibinfo
+    is_acm = bool(re.search(r'\\bibfield\{author\}|\\bibinfo\{person\}', text))
+
+    refs = []
+    for idx, m in enumerate(matches):
+        key = m.group(1).strip()
+        block_start = m.end()
+        block_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        block = text[block_start:block_end]
+
+        authors = ''
+        year = ''
+        title = ''
+
+        if is_acm:
+            # --- Authors: collect all \bibinfo{person}{...} in this block ---
+            persons = []
+            for pm in re.finditer(r'\\bibinfo\{person\}\{', block):
+                content, _ = _extract_braced(block, pm.end() - 1)
+                persons.append(_clean_bbl_text(content))
+            authors = ', '.join(persons)
+
+            # --- Year: first \bibinfo{year}{YYYY} ---
+            ym = re.search(r'\\bibinfo\{year\}\{(\d{4})\}', block)
+            if ym:
+                year = ym.group(1)
+
+            # --- Title: \showarticletitle{...} ---
+            tm = re.search(r'\\showarticletitle\{', block)
+            if tm:
+                content, _ = _extract_braced(block, tm.end() - 1)
+                title = _clean_bbl_text(content)
+        else:
+            # --- Plain / natbib format ---
+            segments = re.split(r'\\newblock\s*', block)
+            raw_authors = _clean_bbl_text(segments[0]).rstrip('.')
+            author_parts = [a.strip() for a in re.split(r'\s+and\s+', raw_authors, flags=re.IGNORECASE) if a.strip()]
+            normalised = []
+            for part in author_parts:
+                part = re.sub(r'\s+', ' ', part).strip().rstrip('.,')
+                if ',' in part:
+                    last, _, first = part.partition(',')
+                    normalised.append(f"{first.strip()} {last.strip()}")
+                else:
+                    normalised.append(part)
+            authors = ', '.join(normalised)
+
+            ym = re.search(r'\b((?:19|20)\d{2})\b', block)
+            year = ym.group(1) if ym else ''
+
+            for seg in segments[1:]:
+                cleaned = _clean_bbl_text(seg)
+                if len(cleaned) < 10:
+                    continue
+                if re.match(r'^[\d\s\-,:.()]+$', cleaned):
+                    continue
+                if re.search(r'\b(?:pages?|pp\.?|vol\.?|no\.?|volume|number|edition)\b',
+                             cleaned, re.IGNORECASE):
+                    continue
+                title = cleaned.rstrip('.')
+                break
+
+        full_ref_text = f"{authors}. {year}. {title}."
+        refs.append({'id': key, 'authors': authors, 'year': year,
+                     'title': title, 'text': full_ref_text, 'raw': full_ref_text})
+    return refs
+
+
+def parse_bbl_file(bbl_path):
+    """Parse a .bbl file (natbib or biblatex/biber) into ref dicts."""
+    with open(bbl_path, encoding='utf-8') as f:
+        text = f.read()
+
+    # Detect format: biber uses \entry{...}{...}{} / \endentry
+    if r'\entry{' in text and r'\endentry' in text:
+        return _parse_bbl_biber(text)
+    else:
+        return _parse_bbl_natbib(text)
+
+
+def run_check_on_bib(bib_path):
+    """Run reference verification on a .bib or .bbl file, skipping PDF parsing."""
+    output_lines = []
+    def log_print(s=""):
+        output_lines.append(str(s))
+        print(s)
+
+    log_print(f"Checking bib file: {bib_path}")
+    log_print("=" * 60)
+
+    if bib_path.endswith('.bbl'):
+        references = parse_bbl_file(bib_path)
+    else:
+        references = parse_bib_file(bib_path)
+    log_print(f"Loaded {len(references)} entries from bib file.")
+
+    if not references:
+        log_print("WARNING: No entries found in bib file.")
+        return "\n".join(output_lines)
+
+    fake_refs = []
+    swapped_name_refs = []
+
+    log_print("Verifying references against DBLP/Crossref/ArXiv...")
+    log_print(f"{'ID':<20} {'Status':<10} {'Details'}")
+    log_print("-" * 60)
+
+    for ref in references:
+        valid, hit, query_details, names_swapped = check_reference(ref)
+        status = "OK" if valid else "not found"
+        if not valid:
+            ref['failed_queries'] = query_details
+            ref['closest_match'] = hit
+            fake_refs.append(ref)
+            log_print(f"[{ref['id']}] {status:<10} Queries tried: {query_details}")
+        else:
+            log_print(f"[{ref['id']}] {status:<10} Detected: {hit['info'].get('title', '')[:30]}... (Query: {query_details})")
+            if names_swapped:
+                swapped_name_refs.append((ref, hit))
+
+    log_print("-" * 60)
+    if fake_refs:
+        log_print(f"\nFound {len(fake_refs)} references that could not be matched:")
+        for ref in fake_refs:
+            log_print(f"\n[{ref['id']}] {ref['text']}")
+            log_print(f"Queries tried: {ref.get('failed_queries', 'N/A')}")
+            closest = ref.get('closest_match')
+            if closest:
+                info = closest.get('info', {})
+                log_print(f"Closest match: {info.get('title', 'Unknown')} ({info.get('url', '')})\n\t by {info.get('authors', 'Unknown')}")
+    else:
+        log_print("\nAll references verified successfully.")
+
+    if swapped_name_refs:
+        log_print(f"\nFound {len(swapped_name_refs)} references with authors' names backwards:")
+        for ref, hit in swapped_name_refs:
+            log_print(f"\n[{ref['id']}] {ref['text']}")
+            info = hit.get('info', {})
+            log_print(f"Closest match: {info.get('title', 'Unknown')} ({info.get('url', '')})\n\t by {info.get('authors', 'Unknown')}")
+
+    return "\n".join(output_lines)
+
+
 def run_check_on_file(url, submission_id=None, title=None, use_local=False):
     """
     Runs the reference check on a single PDF URL.
@@ -882,7 +1164,7 @@ def process_pdf_folder(folder_path, log_dir):
         pdf_files = glob.glob(os.path.join(folder_path, "*.pdf"))
         logger.info(f"Found {len(pdf_files)} PDF files in {folder_path}")
         
-        for i, pdf_file in enumerate(sorted(pdf_files)):
+        for pdf_file in sorted(pdf_files):
             filename = os.path.basename(pdf_file)
             submission_id = os.path.splitext(filename)[0]
             title = filename
@@ -909,10 +1191,28 @@ def process_pdf_folder(folder_path, log_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Detect potential fake references in PDF submissions.")
-    parser.add_argument("source", help="URL to the PDF file OR path to a .txt file containing URLs OR path to a folder of PDF files")
+    parser.add_argument("source", nargs='?', help="URL to the PDF file OR path to a .txt file containing URLs OR path to a folder of PDF files")
+    parser.add_argument("--bib", metavar="BIB_FILE", help="Path to a .bib or .bbl file to check directly (skips PDF parsing)")
     parser.add_argument("--mailto", help="Email for Crossref polite pool (optional, but recommended for faster queries)")
     args = parser.parse_args()
     CROSSREF_MAILTO = args.mailto
+
+    if args.bib:
+        bib_path = args.bib
+        if not os.path.isfile(bib_path):
+            logger.error(f"Bib file not found: {bib_path}")
+            sys.exit(1)
+        log_content = run_check_on_bib(bib_path)
+        submission_id = os.path.splitext(os.path.basename(bib_path))[0]
+        log_dir = os.path.join(os.getcwd(), "reference_checks")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"{submission_id}.log")
+        with open(log_path, 'w', encoding='utf-8') as f_out:
+            f_out.write(log_content)
+        return
+
+    if not args.source:
+        parser.error("source is required unless --bib is specified")
 
     if os.path.isdir(args.source):
         # Folder mode (PDFs)
