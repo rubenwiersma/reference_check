@@ -576,6 +576,34 @@ def is_match(ref, hit, strict=False):
         
     return False, False
 
+def _format_hit(info):
+    """Return a human-readable multi-line string for a hit's info dict."""
+    # Authors: stored as {'author': [{'text': 'Name'}, ...]}
+    authors_data = info.get('authors', {}).get('author', [])
+    if isinstance(authors_data, dict):
+        authors_data = [authors_data]
+    authors_str = ", ".join(a.get('text', '') for a in authors_data if a.get('text'))
+    if not authors_str:
+        authors_str = "Unknown"
+
+    title = info.get('title', 'Unknown')
+    year  = info.get('year', '')
+    venue = info.get('venue', '')
+    url   = info.get('url', '') or info.get('doi', '')
+
+    lines = [
+        f"  Title:   {title}",
+        f"  Authors: {authors_str}",
+    ]
+    if year:
+        lines.append(f"  Year:    {year}")
+    if venue:
+        lines.append(f"  Venue:   {venue}")
+    if url:
+        lines.append(f"  URL:     {url}")
+    return "\n".join(lines)
+
+
 def calculate_similarity(ref, hit):
     info = hit.get('info', {})
     hit_title = info.get('title', '')
@@ -662,7 +690,10 @@ def check_reference(ref):
         for p in parts:
             p = p.strip()
             if p and p[0].isupper():
-                surnames.append(p.split()[-1]) # take last word as surname
+                last_word = p.split()[-1]
+                if re.match(r'^[A-Z](?:[.\-]+[A-Z])*\.?$', last_word):  # skip initials like "H.", "J.W.", "J.-W."
+                    continue
+                surnames.append(last_word)
         
         author_surnames_str = " ".join(surnames)
     
@@ -1008,8 +1039,7 @@ def run_check_on_bib(bib_path):
             log_print(f"Queries tried: {ref.get('failed_queries', 'N/A')}")
             closest = ref.get('closest_match')
             if closest:
-                info = closest.get('info', {})
-                log_print(f"Closest match: {info.get('title', 'Unknown')} ({info.get('url', '')})\n\t by {info.get('authors', 'Unknown')}")
+                log_print(f"Closest match:\n{_format_hit(closest.get('info', {}))}")
     else:
         log_print("\nAll references verified successfully.")
 
@@ -1017,8 +1047,7 @@ def run_check_on_bib(bib_path):
         log_print(f"\nFound {len(swapped_name_refs)} references with authors' names backwards:")
         for ref, hit in swapped_name_refs:
             log_print(f"\n[{ref['id']}] {ref['text']}")
-            info = hit.get('info', {})
-            log_print(f"Closest match: {info.get('title', 'Unknown')} ({info.get('url', '')})\n\t by {info.get('authors', 'Unknown')}")
+            log_print(f"Closest match:\n{_format_hit(hit.get('info', {}))}")
 
     return "\n".join(output_lines)
 
@@ -1086,22 +1115,14 @@ def run_check_on_file(url, submission_id=None, title=None, use_local=False):
                 
                 closest = ref.get('closest_match')
                 if closest:
-                    info = closest.get('info', {})
-                    c_title = info.get('title', 'Unknown')
-                    c_url = info.get('url', '')
-                    c_authors = info.get('authors', 'Unknown')
-                    log_print(f"Closest match: {c_title} ({c_url})\n\t by {c_authors}")
+                    log_print(f"Closest match:\n{_format_hit(closest.get('info', {}))}")
         else:
             log_print("\nAll references verified successfully.")
         if swapped_name_refs:
             log_print(f"\nFound {len(swapped_name_refs)} references that had authors' names backwards:")
             for ref, hit in swapped_name_refs:
                 log_print(f"\n[{ref['id']}] {ref['text']}")
-                info = hit.get('info', {})
-                c_title = info.get('title', 'Unknown')
-                c_url = info.get('url', '')
-                c_authors = info.get('authors', 'Unknown')
-                log_print(f"Closest match: {c_title} ({c_url})\n\t by {c_authors}")
+                log_print(f"Closest match:\n{_format_hit(hit.get('info', {}))}")
 
     finally:
         if os.path.exists(pdf_path) and not use_local:

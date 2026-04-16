@@ -26,7 +26,7 @@ from reference_check import (
     search_crossref, is_match, calculate_similarity, is_venue_title,
     check_reference, parse_bib_file, parse_bbl_file,
     run_check_on_bib, process_batch_txt, process_pdf_folder,
-    CROSSREF_MAILTO,
+    CROSSREF_MAILTO, _format_hit,
 )
 import reference_check as _rc
 
@@ -360,12 +360,7 @@ def run_check_on_file(url, submission_id=None, title=None, use_local=False):
                 log_print(f"Queries tried: {ref.get('failed_queries', 'N/A')}")
                 closest = ref.get('closest_match')
                 if closest:
-                    info = closest.get('info', {})
-                    log_print(
-                        f"Closest match: {info.get('title', 'Unknown')} "
-                        f"({info.get('url', '')})\n"
-                        f"\tby {info.get('authors', 'Unknown')}"
-                    )
+                    log_print(f"Closest match:\n{_format_hit(closest.get('info', {}))}")
         else:
             log_print("\nAll references verified successfully.")
 
@@ -376,12 +371,7 @@ def run_check_on_file(url, submission_id=None, title=None, use_local=False):
             )
             for ref, hit in swapped_name_refs:
                 log_print(f"\n[{ref['id']}] {ref['text']}")
-                info = hit.get('info', {})
-                log_print(
-                    f"Closest match: {info.get('title', 'Unknown')} "
-                    f"({info.get('url', '')})\n"
-                    f"\tby {info.get('authors', 'Unknown')}"
-                )
+                log_print(f"Closest match:\n{_format_hit(hit.get('info', {}))}")
 
     finally:
         if not use_local and os.path.exists(pdf_path):
