@@ -25,7 +25,7 @@ from reference_check import (
     is_arxiv_ref, extract_arxiv_id, search_arxiv, search_dblp,
     search_crossref, is_match, calculate_similarity, is_venue_title,
     check_reference, parse_bib_file, parse_bbl_file,
-    run_check_on_bib, process_batch_txt, process_pdf_folder,
+    run_check_on_bib,
     CROSSREF_MAILTO, _format_hit,
 )
 import reference_check as _rc
@@ -384,6 +384,56 @@ def run_check_on_file(url, submission_id=None, title=None, use_local=False):
 # CLI
 # ---------------------------------------------------------------------------
 
+def _process_pdf_folder_eccv(folder_path, log_dir):
+    import glob
+    pdf_files = glob.glob(os.path.join(folder_path, "*.pdf"))
+    logger.info(f"Found {len(pdf_files)} PDF files in {folder_path}")
+
+    for pdf_file in sorted(pdf_files):
+        filename = os.path.basename(pdf_file)
+        submission_id = os.path.splitext(filename)[0]
+        log_path = os.path.join(log_dir, f"{submission_id}.log")
+
+        if os.path.exists(log_path):
+            logger.info(f"Skipping {submission_id} (log exists)")
+            continue
+
+        try:
+            log_content = run_check_on_file(
+                pdf_file, submission_id, filename, use_local=True
+            )
+            with open(log_path, 'w', encoding='utf-8') as f_out:
+                f_out.write(log_content)
+        except Exception as e:
+            logger.error(f"Failed to process {pdf_file}: {e}")
+        print("-------------------------------------------\n\n")
+
+
+def _process_batch_txt_eccv(txt_path, log_dir):
+    with open(txt_path, encoding='utf-8') as f:
+        lines = [l.strip() for l in f if l.strip()]
+
+    for line in lines:
+        parts = line.split('\t')
+        url = parts[0]
+        submission_id = parts[1] if len(parts) > 1 else os.path.splitext(os.path.basename(url))[0]
+        title = parts[2] if len(parts) > 2 else submission_id
+        log_path = os.path.join(log_dir, f"{submission_id}.log")
+
+        if os.path.exists(log_path):
+            logger.info(f"Skipping {submission_id} (log exists)")
+            continue
+
+        use_local = not url.startswith("http")
+        try:
+            log_content = run_check_on_file(url, submission_id, title, use_local=use_local)
+            with open(log_path, 'w', encoding='utf-8') as f_out:
+                f_out.write(log_content)
+        except Exception as e:
+            logger.error(f"Failed to process {url}: {e}")
+        print("-------------------------------------------\n\n")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Detect potential fake references in ECCV/Springer LNCS PDF submissions."
@@ -428,12 +478,12 @@ def main():
     if os.path.isdir(args.source):
         log_dir = os.path.join(os.getcwd(), "reference_checks")
         os.makedirs(log_dir, exist_ok=True)
-        process_pdf_folder(args.source, log_dir)
+        _process_pdf_folder_eccv(args.source, log_dir)
 
     elif args.source.endswith(".txt") and os.path.isfile(args.source):
         log_dir = os.path.join(os.getcwd(), "reference_checks")
         os.makedirs(log_dir, exist_ok=True)
-        process_batch_txt(args.source, log_dir)
+        _process_batch_txt_eccv(args.source, log_dir)
 
     else:
         use_local = not args.source.startswith("http")

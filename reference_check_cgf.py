@@ -24,7 +24,7 @@ from reference_check import (
     is_arxiv_ref, extract_arxiv_id, search_arxiv, search_dblp,
     search_crossref, is_match, calculate_similarity, is_venue_title,
     check_reference, parse_bib_file, parse_bbl_file,
-    run_check_on_bib, process_batch_txt, process_pdf_folder,
+    run_check_on_bib,
     CROSSREF_MAILTO, _format_hit,
 )
 import reference_check as _rc
@@ -117,7 +117,7 @@ def find_references_section_cgf(text):
         "Explicit 'References' header not found. "
         "Attempting to detect reference list structure."
     )
-    match1 = re.search(r'\n\[[A-Z][A-Za-z*]+\d{2}\]', text)
+    match1 = re.search(r'\n\[[A-Z][A-Za-z*∗0-9]+\d{2}\]', text)
     if match1 and match1.start() > len(text) * 0.5:
         return text[match1.start():]
 
@@ -136,45 +136,97 @@ def _strip_back_references(text):
     return re.sub(r'\s+\d[\d,\s]*\.?\s*$', '', text.rstrip())
 
 
+def _normalize_format2_authors(authors_str):
+    """Separate glued initials from surnames in format-2 CGF author strings.
+
+    Format-2 concatenates the initial directly onto the surname.
+
+    Only applies when the token looks like SURNAME+INITIAL (all-caps, 4+ chars
+    with 1-2 uppercase letters at the end that look like initials).
+    """
+    result = []
+    for part in authors_str.split(','):
+        part = part.strip()
+        if not part or re.match(r'et al\.?$', part, re.IGNORECASE):
+            if part:
+                result.append(part)
+            continue
+        tokens = part.split()
+        if not tokens:
+            continue
+        first = tokens[0]  # keep trailing '.' — format-2 tokens end with '.'
+        extra_initials = [t.rstrip('.') for t in tokens[1:]]
+
+        # Sub-case A: SURNAME+INITIAL glued together with trailing period,
+        # e.g. 'ALLIEZP.'  -> 'P. ALLIEZ'
+        # Format-1 tokens have no trailing '.', so this only fires for format-2.
+        m = re.match(r'^([A-Z][A-Z\-]{2,})([A-Z]{1,2})\.$', first)
+        if m:
+            surname, raw_initials = m.group(1), m.group(2)
+            all_initials = list(raw_initials) + extra_initials
+            initials_str = '. '.join(all_initials) + '.'
+            result.append(f"{initials_str} {surname}")
+        # Sub-case B: SURNAME and INITIAL separated by a space (PDF line-break
+        # artifact), e.g. 'DESBRUN M.' -> 'M. DESBRUN'
+        elif (len(tokens) >= 2
+              and re.match(r'^[A-Z][A-Z\-]{2,}$', first)
+              and re.match(r'^[A-Z]{1,2}\.$', tokens[-1])):
+            all_initials = [t.rstrip('.') for t in tokens[1:]]
+            initials_str = '. '.join(all_initials) + '.'
+            result.append(f"{initials_str} {first}")
+        else:
+            result.append(part)
+    return ', '.join(result)
+
+
 # Unicode curly/typographic quotes used in CGF PDFs, plus ASCII fallback
-_OPEN_QUOTE = r'["“„]'   # " or „ or "
-_CLOSE_QUOTE = r'["”“]'  # " or "
+_OPEN_QUOTE = r'[""„]'   # " or „ or "
+_CLOSE_QUOTE = r'["""]'  # " or "
 
 
 def _split_cgf_author_title(block):
     """Split a CGF reference block into (authors_raw, rest_of_entry).
 
-    CGF author patterns (after [Key]):
-      SURNAME, FIRSTNAME, SURNAME2, FIRSTNAME2, and SURNAME3, FIRSTNAME3. "Title"
+    Two CGF author styles are supported:
+
+    Format 1 — full names, period before (quoted) title:
+      SURNAME, FIRSTNAME, ..., and SURNAME2, FIRSTNAME2. "Title"
       SURNAME, FIRSTNAME, et al. Title
-      SURNAME, FIRSTNAME. Title
+
+    Format 2 — initials glued to surname, colon separator:
+      SURNAMEFI., SURNAME2FI2.: Title
+      SURNAMEFI., et al.: Title
     """
-    # Case 1: "et al." marks end of author list
-    m = re.match(r'^(.*?et al\.)\s*(.*)', block, re.DOTALL)
+    # Case 1: "et al." marks end of author list — handles both ". " and ".:" separators
+    m = re.match(r'^(.*?et al\.)\s*:?\s*(.*)', block, re.DOTALL)
     if m:
         return m.group(1).strip(), m.group(2).strip()
 
-    # Case 2: quoted title (handles ASCII " and Unicode curly quotes " ")
-    # Matches '. "' with optional space between period and opening quote
+    # Case 2: format-2 — colon immediately after a period (INITIAL.:) is the separator.
+    # \.\s*: matches only when ':' follows '.' with only optional whitespace between,
+    # so it does NOT match .DOI:, .URL:, .4:, or other such patterns.
+    # Include the '.' in authors (m.start()+1) so the trailing period is preserved
+    # for the _normalize_format2_authors regex.
+    m = re.search(r'\.\s*:', block)
+    if m:
+        return block[:m.start() + 1].strip(), block[m.end():].strip()
+
+    # Case 3: format-1, quoted title (handles ASCII " and Unicode curly quotes " ")
     m = re.search(r'\.\s*' + _OPEN_QUOTE, block)
     if m:
         return block[:m.start()].strip(), block[m.end() - 1:].strip()
 
-    # Case 3: unquoted title — find first '.' after which the next token is
-    # not an all-caps word (to avoid splitting within author list), including
-    # when the period is directly adjacent to the first title word (no space).
+    # Case 4: format-1, unquoted title — find first '.' after which the next token is
+    # not an all-caps word (to avoid splitting within author list).
     for m in re.finditer(r'\.', block):
         after = block[m.end():]
-        # Skip leading whitespace to find the first real character
         after_stripped = after.lstrip()
         first_word_m = re.match(r'([A-Za-z]+)', after_stripped)
         if not first_word_m:
             continue
         first_word = first_word_m.group(1)
-        # If the first word after '.' is not ALL-CAPS, it's the title start
         if not first_word.isupper():
             return block[:m.start()].strip(), after_stripped.strip()
-        # Also treat as title start if it looks like a URL, arXiv, or DOI
         if re.match(r'(?:https?://|arXiv:|DOI:)', after_stripped, re.IGNORECASE):
             return block[:m.start()].strip(), after_stripped.strip()
 
@@ -193,20 +245,27 @@ def _extract_quoted_title(rest):
 def _extract_unquoted_title(rest):
     """Extract the title from an unquoted CGF entry.
 
-    These are arXiv preprints or books where the title is not wrapped
-    in double quotes.  The title runs up to the year or venue marker.
+    These are arXiv preprints, books, or format-2 journal papers where the
+    title is not wrapped in double quotes.  The title runs up to the first
+    period that precedes a venue/publisher word.
     """
-    # Strip year marker and everything after
+    # Strip year marker and everything after (handles "(2010), pages" at end)
     rest_no_year = re.sub(r'\(\d{4}\).*', '', rest).strip()
-    # Strip trailing URL or DOI
-    rest_no_url = re.sub(r'(?:https?://|DOI:|arXiv:)\S+', '', rest_no_year).strip()
-    # Strip publication venue clues: "YYYY." standalone year without parens
-    rest_no_url = re.sub(r'\b\d{4}\b\.?\s*$', '', rest_no_url).strip()
-    # The title is everything up to the first period that ends a sentence
-    pos = rest_no_url.find('. ')
-    if pos > 0:
-        return rest_no_url[:pos].strip()
-    return rest_no_url.rstrip('.').strip()
+    # Strip trailing standalone bare year (arXiv style: "2023.")
+    rest_no_year = re.sub(r'\b\d{4}\b\.?\s*$', '', rest_no_year).strip()
+    # Strip URL/DOI/arXiv identifiers
+    rest_clean = re.sub(r'(?:https?://|DOI:\s*|arXiv:\s*)\S+', '', rest_no_year).strip()
+    if not rest_clean:
+        rest_clean = rest_no_year
+
+    # The title ends at the first period followed by a venue indicator:
+    #   '.[A-Z]'   — period directly attached to uppercase (format-2: 'title.ACM')
+    #   '. [A-Z]'  — period then space then uppercase ('title. In Venue')
+    #   '.arXiv'   — arXiv preprint marker
+    m = re.search(r'\.(?:[A-Z]|\s+[A-Z]|arXiv)', rest_clean)
+    if m:
+        return rest_clean[:m.start()].strip()
+    return rest_clean.rstrip('.').strip()
 
 
 def extract_references_list_cgf(ref_section_text):
@@ -227,7 +286,7 @@ def extract_references_list_cgf(ref_section_text):
     text = re.sub(r'\n+', '\n', text)
 
     # 4. Split into individual reference blocks on "[Key]" at start of line
-    entries = re.split(r'\n(\[[A-Z][A-Za-z*0-9]+\d{2}\])\s*', '\n' + text.strip())
+    entries = re.split(r'\n(\[[A-Z][A-Za-z*∗0-9]+\d{2}\])\s*', '\n' + text.strip())
     # layout: [pre-text, key1, block1, key2, block2, ...]
 
     refs = []
@@ -264,9 +323,11 @@ def extract_references_list_cgf(ref_section_text):
         authors_clean = re.sub(r',?\s*et al\.?', '', authors_raw).strip()
         authors_clean = re.sub(r'\band\b', ',', authors_clean)
         authors_clean = re.sub(r',\s*,', ',', authors_clean).strip().strip(',').strip()
+        # Separate glued initials for format-2 style (SURNAMEFI. → FI. SURNAME)
+        authors_clean = _normalize_format2_authors(authors_clean)
 
         # Extract title
-        if rest and rest[0] in '"“„':
+        if rest and rest[0] in '""„':
             title = _extract_quoted_title(rest) or ''
         else:
             title = _extract_unquoted_title(rest)
@@ -387,6 +448,60 @@ def run_check_on_file(url, submission_id=None, title=None, use_local=False):
 
 
 # ---------------------------------------------------------------------------
+# Folder / batch processing (override shared versions to use CGF parser)
+# ---------------------------------------------------------------------------
+
+def _process_pdf_folder_cgf(folder_path, log_dir):
+    import glob
+    pdf_files = glob.glob(os.path.join(folder_path, "*.pdf"))
+    logger.info(f"Found {len(pdf_files)} PDF files in {folder_path}")
+
+    for pdf_file in sorted(pdf_files):
+        filename = os.path.basename(pdf_file)
+        submission_id = os.path.splitext(filename)[0]
+        log_path = os.path.join(log_dir, f"{submission_id}.log")
+
+        if os.path.exists(log_path):
+            logger.info(f"Skipping {submission_id} (log exists)")
+            continue
+
+        try:
+            log_content = run_check_on_file(
+                pdf_file, submission_id, filename, use_local=True
+            )
+            with open(log_path, 'w', encoding='utf-8') as f_out:
+                f_out.write(log_content)
+        except Exception as e:
+            logger.error(f"Failed to process {pdf_file}: {e}")
+        print("-------------------------------------------\n\n")
+
+
+def _process_batch_txt_cgf(txt_path, log_dir):
+    with open(txt_path, encoding='utf-8') as f:
+        lines = [l.strip() for l in f if l.strip()]
+
+    for line in lines:
+        parts = line.split('\t')
+        url = parts[0]
+        submission_id = parts[1] if len(parts) > 1 else os.path.splitext(os.path.basename(url))[0]
+        title = parts[2] if len(parts) > 2 else submission_id
+        log_path = os.path.join(log_dir, f"{submission_id}.log")
+
+        if os.path.exists(log_path):
+            logger.info(f"Skipping {submission_id} (log exists)")
+            continue
+
+        use_local = not url.startswith("http")
+        try:
+            log_content = run_check_on_file(url, submission_id, title, use_local=use_local)
+            with open(log_path, 'w', encoding='utf-8') as f_out:
+                f_out.write(log_content)
+        except Exception as e:
+            logger.error(f"Failed to process {url}: {e}")
+        print("-------------------------------------------\n\n")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -433,12 +548,12 @@ def main():
     if os.path.isdir(args.source):
         log_dir = os.path.join(os.getcwd(), "reference_checks")
         os.makedirs(log_dir, exist_ok=True)
-        process_pdf_folder(args.source, log_dir)
+        _process_pdf_folder_cgf(args.source, log_dir)
 
     elif args.source.endswith(".txt") and os.path.isfile(args.source):
         log_dir = os.path.join(os.getcwd(), "reference_checks")
         os.makedirs(log_dir, exist_ok=True)
-        process_batch_txt(args.source, log_dir)
+        _process_batch_txt_cgf(args.source, log_dir)
 
     else:
         use_local = not args.source.startswith("http")
